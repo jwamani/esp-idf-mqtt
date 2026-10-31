@@ -9,6 +9,8 @@
 #include "building.h"
 #include "access_ctrl.h"
 #include "storage.h"
+#include "management.h"
+#include "hub_status.h"
 
 
 void on_message(const char *topic, const char *data)
@@ -18,6 +20,11 @@ void on_message(const char *topic, const char *data)
 
 void app_main(void)
 {
+    // management component: schedule, admin login and the serial console REPL
+    ESP_ERROR_CHECK(management_init());
+    management_register_status_ext(print_hub_status_ext);
+    ESP_ERROR_CHECK(management_start_cli());
+
     net_start(HUB_CLIENT_ID, TOPIC_ROOMS_ALL, NULL); // no status topic for the hub, it is always online
     rooms_init();
     storage_init();  // SD card mount + users.csv into RAM (before RFID starts)
