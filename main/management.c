@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "esp_console.h"
 #include "management_data.h"
+#include "storage.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -708,6 +709,182 @@ static int cmd_records(int argc, char **argv)
     return 1;
 }
 
+// Read one echoed line from the serial terminal (used for interactive prompts).
+// Backspace deletes the last character; Enter finishes. Returns the length.
+static int read_line(char *buf, int max_len)
+{
+    int idx = 0;
+
+    while (1)
+    {
+        int ch = getchar();
+
+        if (ch == EOF)
+        {
+            clearerr(stdin);
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (ch == '\n' || ch == '\r')
+        {
+            putchar('\n');
+            fflush(stdout);
+            break;
+        }
+        if ((ch == 0x7F || ch == '\b') && idx > 0)
+        {
+            idx--;
+            printf("\b \b");
+            fflush(stdout);
+        }
+        else if (ch >= 0x20 && ch < 0x7F && idx < max_len - 1)
+        {
+            buf[idx++] = (char)ch;
+            putchar(ch);
+            fflush(stdout);
+        }
+    }
+    buf[idx] = '\0';
+    return idx;
+}
+
+// user add                          → interactive prompts for every field
+// user add <uid> <name> <role> <enabled>   → one-shot (scripting)
+// user delete <uid>                 → confirm before deleting
+static int cmd_user(int argc, char **argv)
+{
+    if (!management_admin_is_logged_in())
+    {
+        printf("Access denied. Administrator login required.\n");
+        return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "add") == 0)
+    {
+        char uid[UID_STR_LEN];
+        char name[16];
+        char role[16];
+        char enabled[8];
+
+        printf("Enter UID: ");
+        fflush(stdout);
+        read_line(uid, sizeof uid);
+        if (uid[0] == '\0')
+        {
+            printf("Aborted.\n");
+            return 0;
+        }
+
+        printf("Enter name: ");
+        fflush(stdout);
+        read_line(name, sizeof name);
+        if (name[0] == '\0')
+        {
+            strlcpy(name, "Unknown", sizeof name);
+        }
+
+        printf("Enter role (user/admin): ");
+        fflush(stdout);
+        read_line(role, sizeof role);
+        if (role[0] == '\0')
+        {
+            strlcpy(role, "user", sizeof role);
+        }
+
+        printf("Enabled? (y/n): ");
+        fflush(stdout);
+        read_line(enabled, sizeof enabled);
+        int on = (enabled[0] == 'y' || enabled[0] == 'Y' || enabled[0] == '1' ||
+                  strcmp(enabled, "on") == 0 || strcmp(enabled, "true") == 0);
+
+        if (users_add(uid, name, role, on != 0))
+        {
+            printf("User %s added.\n", uid);
+        }
+        else
+        {
+            printf("Failed to add user %s (table full or uid exists).\n", uid);
+        }
+        return 0;
+    }
+
+    if (argc == 6 && strcmp(argv[1], "add") == 0)
+    {
+        bool en = (strcmp(argv[5], "1") == 0 ||
+                   strcmp(argv[5], "true") == 0 ||
+                   strcmp(argv[5], "on") == 0);
+
+        if (users_add(argv[2], argv[3], argv[4], en))
+        {
+            printf("User %s added.\n", argv[2]);
+        }
+        else
+        {
+            printf("Failed to add user %s (table full or uid exists).\n", argv[2]);
+        }
+        return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "delete") == 0)
+    {
+        char uid[UID_STR_LEN];
+        printf("UID to delete: ");
+        fflush(stdout);
+        read_line(uid, sizeof uid);
+        if (uid[0] == '\0')
+        {
+            printf("Aborted.\n");
+            return 0;
+        }
+        printf("Delete user %s? (y/n): ");
+        fflush(stdout);
+        char confirm[8];
+        read_line(confirm, sizeof confirm);
+        if (confirm[0] != 'y' && confirm[0] != 'Y')
+        {
+            printf("Delete cancelled.\n");
+            return 0;
+        }
+        if (users_delete(uid))
+        {
+            printf("User %s deleted.\n", uid);
+        }
+        else
+        {
+            printf("Failed to delete user %s (not found).\n", uid);
+        }
+        return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "delete") == 0)
+    {
+        printf("Delete user %s? (y/n): ", argv[2]);
+        fflush(stdout);
+        char confirm[8];
+        read_line(confirm, sizeof confirm);
+        if (confirm[0] != 'y' && confirm[0] != 'Y')
+        {
+            printf("Delete cancelled.\n");
+            return 0;
+        }
+        if (users_delete(argv[2]))
+        {
+            printf("User %s deleted.\n", argv[2]);
+        }
+        else
+        {
+            printf("Failed to delete user %s (not found).\n", argv[2]);
+        }
+        return 0;
+    }
+
+    printf("Usage: user add\n");
+    printf("       user add <uid> <name> <role> <enabled>\n");
+    printf("       user delete <uid>\n");
+    printf("       enabled: 1 | true | on\n");
+    return 1;
+}
+
 esp_err_t management_start_cli(void)
 {
     if (!initialized)
@@ -737,6 +914,7 @@ esp_err_t management_start_cli(void)
         {.command = "occupancy", .help = "Occupancy query", .hint = "building | rooms <id>", .func = &cmd_occupancy},
         {.command = "lighting", .help = "Room lighting query", .hint = "status <id>", .func = &cmd_lighting},
         {.command = "access", .help = "Access history (admin)", .hint = "records | records <uid>", .func = &cmd_records},
+        {.command = "user", .help = "Manage users (admin)", .hint = "add <uid> <name> <role> <enabled> | delete <uid>", .func = &cmd_user},
     };
 
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
