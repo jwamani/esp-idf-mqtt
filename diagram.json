@@ -1,21 +1,389 @@
 {
-	"version": 1,
-	"author": "demo",
-	"editor": "wokwi",
-	"parts": [
-		{
-			"type": "board-esp32-s3-devkitc-1",
-			"id": "esp",
-			"top": 0,
-			"left": 0,
-			"attrs": {
-				"macAddress": "24:0a:c4:00:01:11"
-			}
-		}
-	],
-	"connections": [
-		["esp:TX", "$serialMonitor:RX", "", []],
-		["esp:RX", "$serialMonitor:TX", "", []]
-	],
-	"dependencies": {}
+  "version": 1,
+  "author": "Member A",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-s3-devkitc-1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "board-mfrc522",
+      "id": "rfid_entry",
+      "top": -190,
+      "left": -290,
+      "attrs": {}
+    },
+    {
+      "type": "board-mfrc522",
+      "id": "rfid_exit",
+      "top": 60,
+      "left": -290,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-servo",
+      "id": "servo_entry",
+      "top": -170,
+      "left": 230,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-servo",
+      "id": "servo_exit",
+      "top": -50,
+      "left": 230,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-lcd1602",
+      "id": "lcd",
+      "top": 80,
+      "left": 200,
+      "attrs": {
+        "pins": "i2c"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_en_g",
+      "top": 270,
+      "left": 60,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_en_r",
+      "top": 270,
+      "left": 140,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_ex_g",
+      "top": 270,
+      "left": 220,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_ex_r",
+      "top": 270,
+      "left": 300,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_en_g",
+      "top": 340,
+      "left": 60,
+      "attrs": {
+        "color": "green",
+        "label": "ENTRY OK"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_en_r",
+      "top": 340,
+      "left": 140,
+      "attrs": {
+        "color": "red",
+        "label": "ENTRY NO"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_ex_g",
+      "top": 340,
+      "left": 220,
+      "attrs": {
+        "color": "green",
+        "label": "EXIT OK"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_ex_r",
+      "top": 340,
+      "left": 300,
+      "attrs": {
+        "color": "red",
+        "label": "EXIT NO"
+      }
+    },
+    {
+      "type": "wokwi-microsd-card",
+      "id": "sd1",
+      "top": -40,
+      "left": 500,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [
+      "esp:TX",
+      "$serialMonitor:RX",
+      "",
+      []
+    ],
+    [
+      "esp:RX",
+      "$serialMonitor:TX",
+      "",
+      []
+    ],
+    [
+      "rfid_entry:3.3V",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "rfid_entry:RST",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "rfid_entry:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "rfid_entry:SCK",
+      "esp:12",
+      "blue",
+      []
+    ],
+    [
+      "rfid_entry:MOSI",
+      "esp:11",
+      "purple",
+      []
+    ],
+    [
+      "rfid_entry:MISO",
+      "esp:13",
+      "orange",
+      []
+    ],
+    [
+      "rfid_entry:SDA",
+      "esp:10",
+      "green",
+      []
+    ],
+    [
+      "rfid_exit:3.3V",
+      "esp:3V3.2",
+      "red",
+      []
+    ],
+    [
+      "rfid_exit:RST",
+      "esp:3V3.2",
+      "red",
+      []
+    ],
+    [
+      "rfid_exit:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "rfid_exit:SCK",
+      "esp:12",
+      "blue",
+      []
+    ],
+    [
+      "rfid_exit:MOSI",
+      "esp:11",
+      "purple",
+      []
+    ],
+    [
+      "rfid_exit:MISO",
+      "esp:13",
+      "orange",
+      []
+    ],
+    [
+      "rfid_exit:SDA",
+      "esp:9",
+      "green",
+      []
+    ],
+    [
+      "servo_entry:V+",
+      "esp:5V",
+      "red",
+      []
+    ],
+    [
+      "servo_entry:GND",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "servo_entry:PWM",
+      "esp:15",
+      "green",
+      []
+    ],
+    [
+      "servo_exit:V+",
+      "esp:5V",
+      "red",
+      []
+    ],
+    [
+      "servo_exit:GND",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "servo_exit:PWM",
+      "esp:16",
+      "green",
+      []
+    ],
+    [
+      "lcd:VCC",
+      "esp:5V",
+      "red",
+      []
+    ],
+    [
+      "lcd:GND",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "lcd:SDA",
+      "esp:17",
+      "green",
+      []
+    ],
+    [
+      "lcd:SCL",
+      "esp:18",
+      "yellow",
+      []
+    ],
+    [
+      "esp:1",
+      "r_en_g:1",
+      "green",
+      []
+    ],
+    [
+      "r_en_g:2",
+      "led_en_g:A",
+      "green",
+      []
+    ],
+    [
+      "led_en_g:C",
+      "esp:GND.3",
+      "black",
+      []
+    ],
+    [
+      "esp:2",
+      "r_en_r:1",
+      "red",
+      []
+    ],
+    [
+      "r_en_r:2",
+      "led_en_r:A",
+      "red",
+      []
+    ],
+    [
+      "led_en_r:C",
+      "esp:GND.3",
+      "black",
+      []
+    ],
+    [
+      "esp:38",
+      "r_ex_g:1",
+      "green",
+      []
+    ],
+    [
+      "r_ex_g:2",
+      "led_ex_g:A",
+      "green",
+      []
+    ],
+    [
+      "led_ex_g:C",
+      "esp:GND.4",
+      "black",
+      []
+    ],
+    [
+      "esp:39",
+      "r_ex_r:1",
+      "red",
+      []
+    ],
+    [
+      "r_ex_r:2",
+      "led_ex_r:A",
+      "red",
+      []
+    ],
+    [
+      "led_ex_r:C",
+      "esp:GND.4",
+      "black",
+      []
+    ],
+    [
+      "esp:4",
+      "sd1:SCK",
+      "orange",
+      []
+    ],
+    [
+      "esp:5",
+      "sd1:DI",
+      "orange",
+      []
+    ],
+    [
+      "esp:6",
+      "sd1:DO",
+      "orange",
+      []
+    ],
+    [
+      "esp:7",
+      "sd1:CS",
+      "orange",
+      []
+    ]
+  ],
+  "dependencies": {}
 }

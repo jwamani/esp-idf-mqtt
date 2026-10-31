@@ -2,3 +2,8 @@
 version = 1
 firmware = 'build/flasher_args.json'
 elf = 'build/mqtt.elf'
+
+# the firmware's SD card files appear back in this folder when the simulation stops
+[[sdcard]]
+folder = 'sdcard'
+writeback = true
