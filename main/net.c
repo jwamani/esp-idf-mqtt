@@ -75,7 +75,9 @@ static void wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config)); // Set Wi-Fi configuration
     ESP_ERROR_CHECK(esp_wifi_start());                               // Start Wi-Fi
 
-    xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY); // wait for the wifi connection
+    // wait, but do not block forever: the hub must keep working (doors, access)
+    // even when there is no network. The handlers above reconnect in the background.
+    xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
 }
 
 // Start the clock (NTP)
