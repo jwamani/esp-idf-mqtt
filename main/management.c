@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "management.h"
 #include "esp_log.h"
 #include <stdbool.h>
@@ -6,6 +7,7 @@
 #include <string.h>
 #include "esp_timer.h"
 #include "esp_console.h"
+#include "management_data.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -190,7 +192,7 @@ esp_err_t management_set_schedule(
         ESP_LOGE(TAG, "Closing time must be after opening time");
         return ESP_ERR_INVALID_ARG;
     }
-    
+
     // Update the schedule atomically: the whole new schedule lands under one lock
     xSemaphoreTake(sched_lock, portMAX_DELAY);
     opening_hour = open_hour;
@@ -443,7 +445,7 @@ static int cmd_login(int argc, char **argv)
         }
         if ((ch == 0x7F || ch == '\b') && pin_index > 0)
         {
-            pin_index--;                    // erase the last asterisk
+            pin_index--; // erase the last asterisk
             printf("\b \b");
             fflush(stdout);
         }
@@ -563,6 +565,149 @@ static int cmd_logs(int argc, char **argv)
     return 1;
 }
 
+// occupancy building | occupancy rooms <id>, from the management_data seam
+static int cmd_occupancy(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "building") == 0)
+    {
+        int count = 0;
+        esp_err_t result = management_get_building_occupancy(&count);
+
+        if (result == ESP_OK)
+        {
+            printf("Building occupancy: %d people inside\n", count);
+        }
+        else if (result == ESP_ERR_NOT_FOUND)
+        {
+            printf("Building occupancy: no data yet.\n");
+        }
+        else
+        {
+            printf("Failed to retrieve building occupancy.\n");
+        }
+        return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "rooms") == 0)
+    {
+        int room_id = atoi(argv[2]);
+        bool occupied = false;
+        esp_err_t result = management_get_room_occupancy(room_id, &occupied);
+
+        if (result == ESP_OK)
+        {
+            printf("Room %d: %s\n", room_id, occupied ? "OCCUPIED" : "UNOCCUPIED");
+        }
+        else if (result == ESP_ERR_NOT_FOUND)
+        {
+            printf("Room %d: no such room is reporting.\n", room_id);
+        }
+        else
+        {
+            printf("Failed to retrieve room occupancy.\n");
+        }
+        return 0;
+    }
+
+    printf("Usage: occupancy building | occupancy rooms <id>\n");
+    return 1;
+}
+
+static int cmd_lighting(int argc, char **argv)
+{
+    if (argc == 3 && strcmp(argv[1], "status") == 0)
+    {
+        int room_id = atoi(argv[2]);
+        bool light_on = false;
+        esp_err_t result = management_get_lighting_status(room_id, &light_on);
+
+        if (result == ESP_OK)
+        {
+            printf("Room %d lighting: %s\n", room_id, light_on ? "ON" : "OFF");
+        }
+        else if (result == ESP_ERR_NOT_FOUND)
+        {
+            printf("Room %d: no such room is reporting.\n", room_id);
+        }
+        else
+        {
+            printf("Failed to retrieve lighting status.\n");
+        }
+        return 0;
+    }
+
+    printf("Usage: lighting status <id>\n");
+    return 1;
+}
+
+// access records: admin-gated query through management_data
+static int cmd_records(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "records") == 0)
+    {
+        if (!management_admin_is_logged_in())
+        {
+            printf("Access denied. Administrator login required.\n");
+            return 0;
+        }
+
+        char records[640];
+        esp_err_t result = management_get_access_records(records, sizeof(records));
+
+        if (result == ESP_OK)
+        {
+            printf("\n=========== ACCESS RECORDS ===========\n");
+            printf("%s", records);
+            printf("\n=======================================\n");
+
+            // viewing records keeps the admin session alive
+            management_admin_update_activity();
+        }
+        else if (result == ESP_ERR_NOT_FOUND)
+        {
+            printf("No access records yet.\n");
+        }
+        else
+        {
+            printf("Failed to retrieve access records.\n");
+        }
+        return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "records") == 0)
+    {
+        if (!management_admin_is_logged_in())
+        {
+            printf("Access denied. Administrator login required.\n");
+            return 0;
+        }
+
+        char records[640];
+        esp_err_t result = management_get_access_records_for_uid(argv[2], records, sizeof(records));
+
+        if (result == ESP_OK)
+        {
+            printf("\n=========== ACCESS RECORDS (%s) ===========\n", argv[2]);
+            printf("%s", records);
+            printf("\n============================================\n");
+
+            management_admin_update_activity();
+        }
+        else if (result == ESP_ERR_NOT_FOUND)
+        {
+            printf("No access records for student %s yet.\n", argv[2]);
+        }
+        else
+        {
+            printf("Failed to retrieve access records for student %s.\n", argv[2]);
+        }
+        return 0;
+    }
+
+    printf("Usage: access records | access records <uid>\n");
+    return 1;
+}
+
 esp_err_t management_start_cli(void)
 {
     if (!initialized)
@@ -583,18 +728,15 @@ esp_err_t management_start_cli(void)
     ESP_ERROR_CHECK(esp_console_register_help_command());
 
     const esp_console_cmd_t commands[] = {
-        { .command = "status",   .help = "Show building status",
-          .func = &cmd_status },
-        { .command = "login",    .help = "Administrator login (PIN is masked)",
-          .func = &cmd_login },
-        { .command = "logout",   .help = "Administrator logout",
-          .func = &cmd_logout },
-        { .command = "override", .help = "Emergency override",
-          .hint = "on|off", .func = &cmd_override },
-        { .command = "schedule", .help = "Building access schedule",
-          .hint = "show | set <HH:MM> <HH:MM>", .func = &cmd_schedule },
-        { .command = "logs",     .help = "Runtime log level",
-          .hint = "info|warn", .func = &cmd_logs },
+        {.command = "status", .help = "Show building status", .func = &cmd_status},
+        {.command = "login", .help = "Administrator login (PIN is masked)", .func = &cmd_login},
+        {.command = "logout", .help = "Administrator logout", .func = &cmd_logout},
+        {.command = "override", .help = "Emergency override", .hint = "on|off", .func = &cmd_override},
+        {.command = "schedule", .help = "Building access schedule", .hint = "show | set <HH:MM> <HH:MM>", .func = &cmd_schedule},
+        {.command = "logs", .help = "Runtime log level", .hint = "info|warn", .func = &cmd_logs},
+        {.command = "occupancy", .help = "Occupancy query", .hint = "building | rooms <id>", .func = &cmd_occupancy},
+        {.command = "lighting", .help = "Room lighting query", .hint = "status <id>", .func = &cmd_lighting},
+        {.command = "access", .help = "Access history (admin)", .hint = "records | records <uid>", .func = &cmd_records},
     };
 
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
