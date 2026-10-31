@@ -5,6 +5,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "driver/spi_common.h"
 #include "driver/sdspi_host.h"
 
@@ -26,6 +29,10 @@ static const char *TAG = "storage";
 
 static user_t s_users[MAX_USERS];
 static int    s_user_count = 0;
+
+/* guards the RAM user table: the decision task looks users up while the
+   console (via users_add/users_delete) can change the table at any moment */
+static SemaphoreHandle_t s_users_lock;
 
 /* false once we know the card is not usable; every log call checks it */
 static bool s_card_ok = false;
@@ -119,6 +126,8 @@ static void load_users(void)
 
 void storage_init(void)
 {
+    s_users_lock = xSemaphoreCreateMutex();
+
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SPI3_HOST;                         // SD has its own bus
 
@@ -161,13 +170,21 @@ void storage_init(void)
 
 bool user_lookup(const char *uid, user_t *out)
 {
+    bool found = false;
+
+    if (!s_users_lock) {                 // storage_init was never reached
+        return false;
+    }
+    xSemaphoreTake(s_users_lock, portMAX_DELAY);
     for (int i = 0; i < s_user_count; i++) {
         if (strcmp(s_users[i].uid, uid) == 0) {
             *out = s_users[i];
-            return true;
+            found = true;
+            break;
         }
     }
-    return false;
+    xSemaphoreGive(s_users_lock);
+    return found;
 }
 
 /* rewrite users.csv from the RAM table (the file is the mirror of the table) */
@@ -193,14 +210,24 @@ static void users_save(void)
 
 bool users_add(const char *uid, const char *name, const char *role, bool enabled)
 {
+    if (!s_users_lock) {
+        return false;
+    }
+
+    xSemaphoreTake(s_users_lock, portMAX_DELAY);
+    /* full table or uid already present? (check inline: user_lookup would try
+       to take the same non-recursive mutex) */
     if (s_user_count >= MAX_USERS) {
+        xSemaphoreGive(s_users_lock);
         ESP_LOGW(TAG, "user table full");
         return false;
     }
-    user_t u;
-    if (user_lookup(uid, &u)) {
-        ESP_LOGW(TAG, "uid %s already exists", uid);
-        return false;
+    for (int i = 0; i < s_user_count; i++) {
+        if (strcmp(s_users[i].uid, uid) == 0) {
+            xSemaphoreGive(s_users_lock);
+            ESP_LOGW(TAG, "uid %s already exists", uid);
+            return false;
+        }
     }
     user_t *row = &s_users[s_user_count++];
     memset(row, 0, sizeof *row);
@@ -208,6 +235,7 @@ bool users_add(const char *uid, const char *name, const char *role, bool enabled
     strlcpy(row->name, name, sizeof row->name);
     strlcpy(row->role, role, sizeof row->role);
     row->enabled = enabled;
+    xSemaphoreGive(s_users_lock);
 
     users_save();
     return true;
@@ -215,14 +243,26 @@ bool users_add(const char *uid, const char *name, const char *role, bool enabled
 
 bool users_delete(const char *uid)
 {
+    if (!s_users_lock) {
+        return false;
+    }
+
+    bool found = false;
+    xSemaphoreTake(s_users_lock, portMAX_DELAY);
     for (int i = 0; i < s_user_count; i++) {
         if (strcmp(s_users[i].uid, uid) == 0) {
             memmove(&s_users[i], &s_users[i + 1],
                     (size_t)(s_user_count - i - 1) * sizeof(user_t));
             s_user_count--;
-            users_save();
-            return true;
+            found = true;
+            break;
         }
+    }
+    xSemaphoreGive(s_users_lock);
+
+    if (found) {
+        users_save();
+        return true;
     }
     ESP_LOGW(TAG, "uid %s not found", uid);
     return false;
