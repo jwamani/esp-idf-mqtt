@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "author": "Namutebi Sulaina Luwambya",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-s3-devkitc-1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {
+        "macAddress": "24:0a:c4:00:01:01"
+      }
+    },
+    {
+      "type": "wokwi-pir-motion-sensor",
+      "id": "pir1",
+      "top": -130,
+      "left": -200,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 40,
+      "left": -230,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": 90,
+      "left": -230,
+      "attrs": {
+        "color": "yellow"
+      }
+    },
+    {
+      "type": "wokwi-photoresistor-sensor",
+      "id": "ldr1",
+      "top": 180,
+      "left": -260,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "ultra1",
+      "top": -150,
+      "left": 260,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [
+      "esp:TX",
+      "$serialMonitor:RX",
+      "",
+      []
+    ],
+    [
+      "esp:RX",
+      "$serialMonitor:TX",
+      "",
+      []
+    ],
+    [
+      "pir1:VCC",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "pir1:GND",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "pir1:OUT",
+      "esp:4",
+      "green",
+      []
+    ],
+    [
+      "esp:5",
+      "r1:1",
+      "blue",
+      []
+    ],
+    [
+      "r1:2",
+      "led1:A",
+      "blue",
+      []
+    ],
+    [
+      "led1:C",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "ldr1:VCC",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "ldr1:GND",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "ldr1:DO",
+      "esp:6",
+      "orange",
+      []
+    ],
+    [
+      "ultra1:VCC",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "ultra1:GND",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "ultra1:TRIG",
+      "esp:7",
+      "purple",
+      []
+    ],
+    [
+      "ultra1:ECHO",
+      "esp:15",
+      "gold",
+      []
+    ]
+  ],
+  "dependencies": {}
+}
