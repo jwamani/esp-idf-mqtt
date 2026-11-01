@@ -1,290 +1,708 @@
-# CoCIS Smart Control and Monitoring System — System Operation Report
+# CoCIS Smart Access & Environmental Control System — System Operation Report
 
-> Group name: <!-- add --> · Course: Embedded Systems · Date: <!-- add -->
+## Group B members
 
-*(Wokwi link, individual videos, member details and individual contributions are filled in the sections at the end.)*
+| Name               | Registration number |
+| ------------------ | ------------------- |
+| Wamani Joshua      | 24/U/1415           |
+| Namugerwa Precious | 24/U/1051           |
+| Mutoni Esther      | 24/U/07511/PS       |
+| Mungi Benjamin     | 24/U/07305/PS       |
+| Namutebi Sulaina   | 24/U/09393/PS       |
 
 ---
 
-## 1. The problem
+## Table of contents
 
-CoCIS has two problems: **unauthorised access to equipment** and **wasted electricity from lights left on**. The system covers one building entrance and two lecture rooms. It must identify people with RFID at the doors, log who is inside, switch room lights by occupancy, enforce a configurable access schedule, store the data, and give management a serial menu — while several ESP32-S3 boards share this data without corrupting it.
+1. [System overview](#1-system-overview)
+2. [High-level design & design decisions](#2-high-level-design--design-decisions)
+3. [System architecture](#3-system-architecture)
+4. [Hardware components & wiring](#4-hardware-components--wiring)
+5. [Communication protocol: MQTT topics, QoS & last will](#5-communication-protocol-mqtt-topics-qos--last-will)
+6. [Software design: hub firmware](#6-software-design-hub-firmware)
+7. [Software design: room firmware](#7-software-design-room-firmware)
+8. [Access control flow](#8-access-control-flow)
+9. [Automated lighting flow](#9-automated-lighting-flow)
+10. [Storage implementation: SD card & logging](#10-storage-implementation-sd-card--logging)
+11. [Serial console: management menu & UART sharing](#11-serial-console-management-menu--uart-sharing)
+12. [Data movement: how information flows through the system](#12-data-movement-how-information-flows-through-the-system)
+13. [Synchronisation design: tasks, mutexes & semaphores](#13-synchronisation-design-tasks-mutexes--semaphores)
+14. [Implemented features & requirements traceability](#14-implemented-features--requirements-traceability)
+15. [Known limitations](#15-known-limitations)
+16. [Wokwi simulation links](#16-wokwi-simulation-links)
+17. [Individual contributions](#17-individual-contributions)
 
-Our answer is a **hub-and-spoke system**: one *entrance terminal* (the hub) owns all shared data, and two *room terminals* report to it over WiFi/MQTT. Only the hub ever changes the shared state, so there are no write conflicts by design.
+---
+
+## 1. System overview
+
+The CoCIS Smart Access & Environmental Control System addresses two problems in a university building: unauthorised access to rooms, and electricity wasted by lights left on in unoccupied rooms. The system covers one building entrance and two lecture rooms.
+
+It is built as a **hub-and-spoke system** deployed across three Wokwi projects, each running one ESP32-S3 board:
+
+- **Entrance hub** — owns all shared data: the user table, the inside list, the access schedule, emergency override state, all logs, and the room table. It runs two MFRC522 RFID readers (entry and exit), two door servos with LEDs, a 16×2 LCD, and an SD card.
+- **Room terminals (×2)** — each owns only its local sensors (PIR motion, ultrasonic distance, LDR) and its light LED. They report occupied/light status to the hub over MQTT and follow the building state (open/closed/emergency) published by the hub.
+
+Rooms never write to shared state and never touch the SD card. Only the hub changes shared data, so by topology there are no write conflicts between terminals.
+
+The three terminals communicate over WiFi through a public MQTT broker (`broker.emqx.io` or a local Mosquitto instance, selectable by one config line). The hub publishes retained building state; rooms publish retained online status and periodic occupancy/light status; rooms also publish intrusion alerts.
 
 ![System overview](1-system-overview.svg)
 
 ---
 
-## 2. Architecture
+## 2. High-level design & design decisions
 
-### 2.1 The three terminals
+### 2.1 Core architectural principle: single logical writer
 
-| Terminal | Board | Owns | Talks to |
-|---|---|---|---|
-| **Entrance hub** | ESP32-S3 | user table, inside list, schedule, all logs, room table | both rooms |
-| **Room 1** | ESP32-S3 | its distance/PIR sensors and its light | the hub |
-| **Room 2** | ESP32-S3 | its distance/PIR sensors and its light | the hub |
+Every piece of shared state has exactly one logical writer, chosen by design:
 
-Each terminal is a separate Wokwi simulation running at the same time. Rooms never touch the SD card and never change configuration — they only report status and follow the building state.
+| Shared state                                    | Logical writer                   |
+| ----------------------------------------------- | -------------------------------- |
+| Inside list (who is in the building)            | Entrance hub, decision task only |
+| User table (users.csv cache)                    | Entrance hub, console / storage  |
+| Access schedule & emergency override            | Entrance hub, management console |
+| Room table (occupied / light / online per room) | Entrance hub, MQTT callback only |
+| Access logs, room logs, system log              | Entrance hub, SD card            |
+| Room-local presence and light state             | Each room terminal, locally only |
 
-### 2.2 Communication
+This single-writer rule is the primary mechanism for **consistency** and **reliability**. There is no distributed locking protocol, no consensus algorithm, and no two-phase commit. The answer to every conflict question is always "what does the hub's copy say?".
 
-The boards talk over **WiFi (Wokwi-GUEST) through MQTT** on a public broker (`broker.emqx.io` or a local Mosquitto instance — one config line).
+### 2.2 Why not peer-to-peer
 
-The topic design follows one rule: **nobody subscribes to its own topic**, which is what removed the echo problem from the earlier test firmware:
+A peer-to-peer design where every board can write the schedule or the inside list would require distributed agreement. With three boards on a shared broker, that introduces write conflicts, last-writer-wins races, and partial-update corruption. The hub-and-spoke topology eliminates this class of bugs entirely: rooms are data sources (they publish sensor readings), the hub is the data sink and decision-maker (it consumes readings and publishes commands).
 
-| Topic | Direction | Payload | Retained | QoS |
-|---|---|---|---|---|
-| `cocis-g1/building` | hub → rooms | `open inside=N` / `closed inside=N` / `emergency inside=N` | yes | 1 |
-| `cocis-g1/rooms/<id>/status` | room → hub | `occupied=<0/1> light=<0/1>` | no | 0 |
-| `cocis-g1/rooms/<id>/alert` | room → hub | `INTRUSION` | no | 0 |
-| `cocis-g1/rooms/<id>/online` | room → hub | `<client-id> online` / `<client-id> offline` (last will) | yes | 1 |
+### 2.3 Fail-safe defaults
 
-- `<id>` is the last three bytes of the board's MAC address (e.g. `000116`), read from the Wokwi board attributes — the same firmware serves both rooms, only the simulated MAC differs, so there is no copy-pasted room code.
-- **Retained** messages mean a room or hub that joins late still gets the last building state immediately, without waiting for the next cycle.
-- **The last will** (LWT) means the broker publishes `offline` for a room that disappears — this is how the hub's room table learns a terminal is gone.
+The system defaults to safe states on failure:
 
-![Message flow](5-message-flow.svg)
+- If WiFi or MQTT is down, the hub keeps making access decisions and driving doors locally; it resumes from retained messages on reconnect.
+- If the SD card is absent or fails, logging is disabled but access control continues normally. An untrustworthy audit log is worse than a stopped one; locking people out because a log disk died is unacceptable.
+- If SNTP has not set the clock, log rows are stamped `no-time` rather than a fabricated timestamp.
+- If a room goes silent, its `online` flag drops via MQTT last will, and the hub marks it offline rather than showing stale data.
 
-### 2.3 Why hub-and-spoke
+### 2.4 One owner per resource (structural, not locked)
 
-A peer-to-peer or "everyone writes the schedule" design would need distributed agreement. With a hub, the answer to *every* conflict question is the same: *what does the hub's copy say?* That is easy to build in the time we had and easy to explain in the presentation.
+Where possible, concurrency is avoided by structure rather than by mutexes. The LCD, servos, door LEDs, RFID chips, and SD card are each driven by exactly one task. A race would require adding a second caller — the code structure makes that visible.
 
----
+### 2.5 Retained messages & last will for distributed state
 
-## 3. Hardware components and wiring
+The broker, not application code, handles two distributed concerns:
 
-### 3.1 Entrance hub
-
-| Component | Qty | Purpose |
-|---|---|---|
-| ESP32-S3 DevKitC-1 | 1 | the hub |
-| MFRC522 RFID reader | 2 | entry reader + exit reader, both on one SPI bus with separate chip-selects |
-| SG90 servo | 2 | one per door actuator |
-| 16×2 LCD (I2C, PCF8574) | 1 | shows Welcome/Denied, live occupancy count and time |
-| LEDs (green + red) | 4 | per door: permitted / denied |
-| — | — | emergency-unlock button (planned, GPIO 40) |
-
-Shared SPI wiring for both readers: SCK 12, MOSI 11, MISO 13, RST tied to 3V3 (soft reset in the driver); chip selects are 10 (entry) and 9 (exit). Servos 15/16 (LEDC 50 Hz), LCD on I2C pins 17/18 at address 0x27, LEDs on 1, 2, 38, 39. Strapping pins 0/3/45/46, USB pins 19/20 and flash pins 26–37 are avoided.
-
-![Hub internals](2-hub-internals.svg)
-
-### 3.2 Room terminal (×2)
-
-| Component | Purpose |
-|---|---|
-| HC-SR501-style PIR sensor | detects *movement* of a warm body |
-| HC-SR04 ultrasonic sensor | detects a *stationary* object in the room (covers the PIR's blind spot: people sitting still) |
-| Photoresistor (LDR) module | daylight check — the light stays off when the room is already bright |
-| LED + resistor | stands for the switched light |
-
-Room pins: PIR 4, light LED 5, LDR 6, HC-SR04 trig 7 / echo 15.
+- **Late join / reconnect**: important messages (building state, room online flags) are retained, so a subscriber gets the last value immediately on subscribe.
+- **Silent terminal death**: MQTT last will publishes `<room>/offline` the instant a TCP connection drops, even mid-crash.
 
 ---
 
-## 4. Software design
+## 3. System architecture
 
-### 4.1 Where everything lives
+### 3.1 Terminals
 
-One repository, one ESP-IDF project per board. The group's shared code sits in the repository root; the `sim/` folders contain earlier iterations and the member sandboxes:
+| Terminal     | Board    | Role                         | Owns                                                |
+| ------------ | -------- | ---------------------------- | --------------------------------------------------- |
+| Entrance hub | ESP32-S3 | Decision engine + data owner | user table, inside list, schedule, logs, room table |
+| Room 1       | ESP32-S3 | Local sensing + lighting     | PIR, ultrasonic, LDR, light LED                     |
+| Room 2       | ESP32-S3 | Local sensing + lighting     | PIR, ultrasonic, LDR, light LED                     |
 
-```
-automated-lighting-control/        (this repository — the group's shared code)
-├── main/                          the entrance-hub firmware (one file per responsibility, §4.2)
-├── components/management/         serial console module (member E): schedule, admin login, CLI
-├── sim/room_1/                    room terminal 1 (diagram.json, MAC …:01)
-├── sim/room_2/                    room terminal 2 — same code as room 1, MAC …:02
-└── docs/                          this report and the diagrams
-```
+Each terminal is a separate Wokwi simulation running concurrently. Both rooms run **identical firmware**; they are distinguished only by their simulated MAC address in `diagram.json`. There is no copy-pasted room code variant.
 
-Both room projects contain **identical firmware**; only the board's simulated MAC address in `diagram.json` differs, which is what the hub reads to tell the rooms apart. There is no copy-pasted room code variant.
+### 3.2 Hub firmware layout (one file per responsibility)
 
-### 4.2 Hub firmware: one file per responsibility
+| File                     | Responsibility                                                                                                                                   |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `app_main.c`             | Boot sequence: init management → net → rooms → storage → access; main loop publishes retained building state                                     |
+| `net.c` / `app_config.h` | WiFi station, SNTP clock, MQTT client behind a small interface (`net_start`, `net_publish`, `net_publish_retained`, `net_time_ok`)               |
+| `rfid_reader.c`          | Polls both MFRC522 chips over SPI, reads card UIDs, debounces repeats, pushes `{door side, UID}` scan events into a FreeRTOS queue               |
+| `access_ctrl.c`          | The decision engine: one task, one input queue, the only place a door may be opened. Runs the full grant/deny check sequence                     |
+| `occupancy.c`            | The "currently inside" list, protected by a FreeRTOS mutex                                                                                       |
+| `door_ctrl.c`            | One task owning all door hardware: servos, LEDs, LCD messages, auto-close timers, emergency hold-open                                            |
+| `lcd_i2c.c`              | 16×2 I2C display driver (PCF8574)                                                                                                                |
+| `rooms.c`                | The hub's view of the rooms: rows with occupied/light/online, filled from incoming MQTT messages                                                 |
+| `building.c`             | Publishes the retained building state (`open/closed/emergency inside=N`)                                                                         |
+| `storage.c`              | SD card: mounts card, loads `users.csv` into RAM at boot, rewrites it on add/delete, appends three log files, degrades gracefully if card absent |
+| `management_bridge.c`    | Glue mapping the console module's schedule/override state onto the interfaces the decision engine uses                                           |
+| `hub_status.c`           | Extra status block for the console (occupancy + rooms)                                                                                           |
 
-| File | Responsibility |
-|---|---|
-| `app_main.c` | `app_main` — starts everything, nothing else |
-| `net.c` + `app_config.h` | WiFi, SNTP clock and the MQTT client, behind a small interface (`net_start`, `net_publish`, `net_publish_retained`, `net_time_ok`) |
-| `rfid_reader.c` | polls both MFRC522 chips over SPI, reads card UIDs, debounces repeats, and pushes `{door side, UID}` events into a queue |
-| `access_ctrl.c` | **the decision engine** — one task, one queue, the only place a door may be opened. Runs the checks listed in §5 |
-| `occupancy.c` | the "currently inside" list, protected by a mutex |
-| `door_ctrl.c` | one task owning all door hardware: servos, LEDs, LCD messages, auto-close timers, emergency hold-open |
-| `lcd_i2c.c` | 16×2 I2C display driver |
-| `rooms.c` | the hub's view of the rooms — rows with occupied/light/online, filled from incoming MQTT messages |
-| `building.c` | publishes the retained building state (`open/closed/emergency inside=N`) |
-| `storage.c` | (member B) the SD card: loads `users.csv` into RAM at boot, rewrites it when a user is added or removed, appends access/room/system events to log files, and degrades gracefully if the card is absent |
-| `management_bridge.c` | half-page glue that maps the console module's schedule and override state onto the interfaces the decision engine uses |
+### 3.3 Integration seams
 
 Member contributions meet through two narrow seams rather than one big shared file:
 
-- `hub_interfaces.h` declares what the decision engine needs from the others: `user_lookup()` and `log_access()` (member B, implemented in `storage.c`), `schedule_is_open()` and `override_active()` (member E, bridged to the management component).
-- The management component (member E) registers only `management_init()` / `management_start_cli()` in `app_main`; everything else it does is behind its own header.
+- `hub_interfaces.h` declares what the decision engine needs: `user_lookup()` and `log_access()` (storage, member B), `schedule_is_open()` and `override_active()` (management, member E).
+- The management component registers only `management_init()` / `management_start_cli()` in `app_main`; everything else is behind its own header.
 
-### 4.3 Room firmware
+### 3.4 Room firmware layout
 
-`room_main.c` starts the light logic and the network; `light.c` runs one task every 100 ms that implements the state machine in §6, plus a status/alert publisher.
-
----
-
-## 5. Access control flow
-
-Two scanners (ENTRY and EXIT) feed one queue, and a single `access_task` makes every decision — one decision-maker means two near-simultaneous taps can never race, and the "who is inside" list stays consistent.
-
-**The full flow** (3-access-flow.svg): idle screen → a card is tapped → debounce (same card + same reader within 2 s is ignored) → decision in this exact order:
-
-1. **Emergency override on?** → at the EXIT, everyone may leave (`ACCESS_EMERGENCY_EXIT`). This exists because the raw spec traps people inside when the building closes, which is unsafe in a fire.
-2. **Card known?** → otherwise `DENIED_UNKNOWN`
-3. **Card enabled?** → otherwise `DENIED_DISABLED`
-4. **Building open?** → otherwise `DENIED_OUTSIDE_HOURS` — and this applies to *exits too*, per requirement 2.6: people inside cannot leave outside the permitted period
-5. **Anti-passback** — entering while already inside, or exiting while not inside, is refused. This keeps the inside list trustworthy
-6. Otherwise **granted**: update the occupancy list, LCD "Welcome/Goodbye *name*", green LED, servo open for 5 s (non-blocking), event logged with the reason
-
-Denials show the exact reason on the LCD, light the red LED for 2 s, and are logged with their reason — the log line tells you whether the *reader*, the *decision* or the *table* failed, which halves debugging time.
-
-![Access flow](3-access-flow.svg)
-
-The scheduled period is configurable by authorised personnel only (member E): an admin logs in over the serial menu (password stored as a salted hash, lockout after repeated failures) and changes the window with a CLI command; the schedule change is itself logged.
+| File               | Responsibility                                                                                             |
+| ------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `rooms/app_main.c` | Starts light sensing, connects WiFi/MQTT, publishes status + alerts on a loop                              |
+| `rooms/light.c`    | One task every 100 ms implementing the lighting state machine (PIR + ultrasonic + LDR + vacancy + warning) |
+| `rooms/net.c`      | WiFi, SNTP, MQTT client (same pattern as hub, different subscriptions)                                     |
 
 ---
 
-## 6. Automated lighting flow
+## 4. Hardware components & wiring
 
-Room logic runs a state machine every 100 ms (room-states.svg):
+### 4.1 Entrance hub
 
-1. **Presence** = PIR motion **OR** an ultrasonic object closer than 250 cm in the beam. The two sensors cover each other's weaknesses (PIR misses still people; ultrasonic misses nothing in the beam).
-2. **Building open:** presence turns the light on if the LDR says the room is dark. Every detection of presence restarts a **vacancy timer** (15 s in the demo; 10 min in a real room) — because a PIR cannot see a person sitting still, the room that becomes "vacant" after the timeout may not truly be; so before switching off, the light **blinks for 5 s as a warning**, and waving at the sensors cancels it.
-3. **Building closed:** the light is forced off, the occupancy flag is cleared, and any presence raises an **INTRUSION alert** to the hub (at most one per 10 s).
-4. **Room status** is published every 5 s to `.../<id>/status`, and **online** on every MQTT connect, so a hub that boots after a room still shows the room correctly (retained online message + periodic status).
+| Component               | Qty | Purpose                                       | Pins                                                                          |
+| ----------------------- | --- | --------------------------------------------- | ----------------------------------------------------------------------------- |
+| ESP32-S3 DevKitC-1      | 1   | Hub controller                                | —                                                                             |
+| MFRC522 RFID reader     | 2   | Entry + exit readers                          | Shared SPI: SCK 12, MOSI 11, MISO 13; CS entry 10, CS exit 9; RST tied to 3V3 |
+| SG90 servo              | 2   | Door actuators (one per door)                 | LEDC 50 Hz: entry 15, exit 16                                                 |
+| 16×2 LCD (I2C, PCF8574) | 1   | Welcome/Denied, occupancy count, time         | I2C SDA 17, SCL 18, address 0x27                                              |
+| LEDs (green + red)      | 4   | Per door: permitted / denied                  | Entry: 1 (green), 2 (red); Exit: 38 (green), 39 (red)                         |
+| MicroSD card            | 1   | `users.csv`, access log, room log, system log | SPI3: SCK 4, DI 5, DO 6, CS 7                                                 |
+
+Both RFID readers share one SPI bus with separate chip-selects. RST is tied to 3V3 with soft reset in the driver. Strapping pins 0/3/45/46, USB pins 19/20, and flash pins 26–37 are avoided.
+
+![Hub internals](2-hub-internals.svg)
+
+### 4.2 Room terminal (×2)
+
+| Component                  | Purpose                                                                  | Pins            |
+| -------------------------- | ------------------------------------------------------------------------ | --------------- |
+| HC-SR501-style PIR sensor  | Detects movement of a warm body                                          | GPIO 4          |
+| HC-SR04 ultrasonic sensor  | Detects stationary objects (covers PIR blind spot: people sitting still) | Trig 7, Echo 15 |
+| Photoresistor (LDR) module | Daylight check — light stays off when room is already bright             | GPIO 6          |
+| LED + resistor             | Stands for the switched light                                            | GPIO 5          |
+
+PIR misses still people; ultrasonic misses nothing in its beam. Together they cover each other's weaknesses.
+
+### 4.3 Power budget and physical feasibility
+
+The design is feasible as a physical prototype, but the simulated wiring should not be treated as a complete power design. The ESP32-S3 is a 3.3 V logic device, while the servos and some display modules are 5 V loads. The safe arrangement is a regulated 5 V supply for the actuators and other 5 V peripherals, the ESP32 board powered through its intended USB/5 V input, and a common ground between all supplies. Servo current should not be routed through the ESP32 board's 3.3 V regulator or thin USB power path.
+
+The following are practical design estimates rather than guaranteed values; the exact current depends on the board revision, servo load, SD card, LCD backlight, and wiring:
+
+| Hub load                | Typical current                   | Important case                                                              |
+| ----------------------- | --------------------------------- | --------------------------------------------------------------------------- |
+| ESP32-S3 DevKitC-1      | 80–250 mA at 5 V input equivalent | WiFi transmit causes short peaks; use the board manufacturer's input limits |
+| Two MFRC522 readers     | about 50–120 mA at 3.3 V          | Both readers can be active while polling                                    |
+| MicroSD card            | about 30–100 mA at 3.3 V          | Write/initialisation peaks can be higher                                    |
+| 16×2 LCD with backlight | about 50–150 mA at 5 V            | Depends mainly on the backlight and backpack                                |
+| Four indicator LEDs     | about 20–60 mA at 3.3 V           | The 220 ohm resistors limit each LED to a modest GPIO load                  |
+| Two SG90-class servos   | about 100–250 mA each moving      | Stall/startup peaks can approach 600–1000 mA each                           |
+
+The rail-by-rail conclusion is:
+
+| Supply path                                                               | Estimated demand                                                                                  | Does it exceed the ESP32 board's supply?                                                                                                                                          |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 3.3 V regulator: two MFRC522 readers, microSD, LEDs, and the ESP32 module | approximately 200–500 mA including WiFi peaks                                                     | Probably not if the specific DevKitC-1 regulator is rated above this, but verify the regulator and board revision datasheets; do not assume the GPIO pins can supply this current |
+| 5 V USB/board path: LCD, ESP32 input, and two servos                      | approximately 0.5–1.0 A during normal servo movement, with possible 1.2–2.3 A startup/stall peaks | Yes, the simultaneous servo peaks can exceed a normal USB port, cable, or board power path                                                                                        |
+
+The 5 V pin on a DevKitC-1 is not a high-current actuator supply; when USB-powered it is effectively the USB 5 V rail. The two servos must therefore use a separate regulated 5 V supply. A 5 V, 2 A supply is a bare practical minimum for light loads; a regulated 5 V, 3 A supply is the recommended prototype choice because it leaves margin for both servos starting together, the LCD backlight, SD writes, and WiFi activity. Connect the external supply ground to ESP32 ground so the PWM signals have a common reference. Add local bulk capacitance near the servo supply, for example 470–1000 µF, plus normal 0.1 µF decoupling near modules. This reduces brownouts but does not replace a correctly rated supply.
+
+Each room terminal has a much smaller load: the ESP32-S3, PIR, LDR module, HC-SR04, and one LED are normally well within a good 5 V USB supply. A 5 V, 1 A supply per room terminal is a reasonable minimum; 5 V, 2 A gives useful margin for WiFi peaks and wiring losses. If the LED is replaced by a real lamp or relay-driven light, that load must be powered and protected separately rather than from an ESP32 GPIO.
+
+There are also three logic-voltage checks required before building physical boards:
+
+1. The MFRC522 and microSD interfaces must remain at 3.3 V. Do not feed their signal pins from 5 V logic.
+2. The LCD is currently powered from 5 V. Many PCF8574 LCD backpacks pull SDA and SCL up to their supply voltage, which can expose the ESP32 I2C pins to 5 V. Use a 3.3 V-compatible backpack, remove/modify its pull-ups, or add an I2C level shifter.
+3. The HC-SR04 Echo output is commonly 5 V. GPIO 15 on each room terminal needs a resistor divider or level shifter before connection to the ESP32. The 3.3 V Trig signal is normally accepted by the sensor.
+
+With these changes, separate regulated power for the servos, common grounds, short decoupled power wiring, and protection for 5 V logic signals, the component set is physically realistic. As currently drawn, it is suitable for Wokwi and functional testing, but powering the servos directly from the ESP32 5 V pin and connecting unmodified 5 V I2C/Echo signals would not be an acceptable physical-board build.
+
+---
+
+## 5. Communication protocol: MQTT topics, QoS & last will
+
+The boards talk over WiFi (Wokwi-GUEST) through MQTT on a public broker (`broker.emqx.io` or local Mosquitto — one config line in `app_config.h`).
+
+### 5.1 Topic design rule
+
+**Nobody subscribes to a topic it publishes.** This removed the echo problem from the earlier test firmware, where a board would receive its own published state and act on it.
+
+### 5.2 Topic table
+
+| Topic                        | Direction   | Payload                                                     | Retained | QoS |
+| ---------------------------- | ----------- | ----------------------------------------------------------- | -------- | --- |
+| `cocis-g1/building`          | hub → rooms | `open inside=N` / `closed inside=N` / `emergency inside=N`  | yes      | 1   |
+| `cocis-g1/rooms/<id>/status` | room → hub  | `room=N occupied=0/1 light=0/1 on_s=… open_s=… saved_pct=…` | no       | 0   |
+| `cocis-g1/rooms/<id>/alert`  | room → hub  | `INTRUSION`                                                 | no       | 0   |
+| `cocis-g1/rooms/<id>/online` | room → hub  | `<client-id> online` / `<client-id> offline` (last will)    | yes      | 1   |
+
+Where `<id>` is the last three bytes of the board's MAC address (e.g. `000116`), read from Wokwi board attributes.
+
+### 5.3 QoS rationale
+
+**QoS 1 (at-least-once)** is used for building state and online/last-will messages. These are critical state messages that must not be lost. The hub's retained building state ensures rooms converge to the correct state on connect, even if they missed the initial broadcast.
+
+**QoS 0 (at-most-once)** is used for room status and alerts. These are telemetry readings. Losing one status update is acceptable because the next heartbeat (every 5 s) and the retained online flag carry the state forward.
+
+### 5.4 Retained messages
+
+Retained messages mean a room or hub that joins late still gets the last building state immediately, without waiting for the next publish cycle. A new subscriber to `cocis-g1/building` receives the last `open/closed/emergency inside=N` the instant it subscribes.
+
+### 5.5 Last will (LWT)
+
+Each room configures a last will on its `online` topic with `retain=1` and `qos=1`. If the room's TCP connection drops (crash, power loss, simulation stopped), the broker publishes `<room>/offline` immediately. The hub's room table learns a terminal is gone without any application-level heartbeat timeout.
+
+### 5.6 Connection setup
+
+Each terminal's `net_start()` performs:
+
+1. `nvs_flash_init()` — initialises NVS for WiFi credential storage.
+2. `esp_netif_init()` + `esp_event_loop_create_default()` — TCP/IP stack and event loop.
+3. `esp_wifi_init()` + `esp_wifi_set_config()` — station mode with SSID/password from `app_config.h`.
+4. `esp_wifi_start()` with background reconnection: on `WIFI_EVENT_STA_DISCONNECTED`, the handler calls `esp_wifi_connect()` again. The hub waits up to 15 s for an IP but does **not** block forever — doors and access control keep working without network.
+5. SNTP clock initialisation via `esp_netif_sntp_init()` for log timestamps.
+6. MQTT client init with `client_id`, optional `last_will` (rooms only), then `esp_mqtt_client_start()`.
+
+On `MQTT_EVENT_CONNECTED`, the client subscribes to its topic at QoS 1 and, if it has a status topic, publishes its retained `online` message. On `MQTT_EVENT_DATA`, the topic and payload are extracted and dispatched to `on_message()`. Handlers are kept short; no blocking I/O or SD writes happen inside the callback.
+
+![Message flow](5-message-flow.svg)
+
+---
+
+## 6. Software design: hub firmware
+
+### 6.1 Boot sequence (`app_main.c`)
+
+`app_main` runs initialisation in a deliberate order:
+
+1. `management_init()` — schedule, admin session, console subsystem.
+2. `management_register_status_ext(print_hub_status_ext)` — hooks occupancy + rooms into the `status` command.
+3. `management_start_cli()` — starts the `esp_console` REPL on UART0 (`CoCIS> ` prompt).
+4. `net_start(HUB_CLIENT_ID, TOPIC_ROOMS_ALL, NULL)` — WiFi, SNTP, MQTT; subscribes to all room topics. Hub has no status topic (it is always online).
+5. `rooms_init()` — allocates the room table mutex.
+6. `storage_init()` — mounts SD card, loads `users.csv` into RAM. Must run before RFID starts so user lookups succeed.
+7. `access_init()` — occupancy list, door hardware, decision task, RFID readers.
+
+After init, the main loop calls `building_announce()` every `PUBLISH_PERIOD_MS`, publishing retained building state.
+
+### 6.2 Network layer (`net.c`)
+
+The network layer is shared between hub and rooms. It encapsulates WiFi, SNTP, and the ESP-IDF MQTT client. Key functions:
+
+- `net_start(client_id, subscribe_topic, status_topic)` — full connection setup as described in §5.6.
+- `net_publish(topic, msg)` — QoS 0, non-retained publish (used for room status/alerts).
+- `net_publish_retained(topic, msg)` — QoS 1, retained publish (used for building state and online flags).
+- `net_time_ok()` — returns true once SNTP has set the clock (year > 2020).
+
+The MQTT event handler runs inside the MQTT task context. `MQTT_EVENT_DATA` copies topic and payload into local buffers and calls `on_message()`. Handlers are kept short; no blocking I/O or SD writes happen inside the callback.
+
+### 6.3 RFID reader (`rfid_reader.c`)
+
+One task (`rfid_task`) polls both MFRC522 readers sequentially every 100 ms over a shared SPI bus (SPI2_HOST, 1 MHz, mode 0). Each reader has its own chip-select (entry: GPIO 10, exit: GPIO 9).
+
+For each reader, the task:
+
+1. Sends `REQA` (0x26) to detect a card.
+2. If a card answers, reads the UID via the anti-collision sequence (handles 4-byte and 7-byte UIDs).
+3. Sends `HLTA` to halt the card until it is removed and re-presented.
+4. Formats the UID as a hex string and checks debounce: if the same UID on the same reader was seen within `SCAN_DEBOUNCE_MS` (2 s), the event is dropped.
+5. Otherwise, pushes a `scan_event_t` (door side + UID) into the scan queue with zero timeout. If the queue is full, the tap is dropped and logged.
+
+Reader init performs a soft reset, waits for the reset bit to clear, reads the chip version (rejects 0x00/0xFF as not present), configures timers and the antenna, then marks the reader ready.
+
+### 6.4 Access control decision engine (`access_ctrl.c`)
+
+The decision engine is a single task (`access_task`) that consumes from a single scan queue (`xQueueCreate(8, sizeof(scan_event_t))`). One queue in, one decision at a time — two near-simultaneous taps can never race.
+
+The `decide()` function checks conditions in this exact order:
+
+1. **Emergency override on + exit side** → `ACCESS_EMERGENCY_EXIT` (everyone may leave during emergency).
+2. **Card known?** (user lookup) → `DENIED_UNKNOWN` if not.
+3. **Card enabled?** → `DENIED_DISABLED` if disabled.
+4. **Building open?** (`schedule_is_open()`) → `DENIED_OUTSIDE_HOURS` — applies to entry **and** exit per requirement 2.6.
+5. **Anti-passback** — entering while already inside, or exiting while not inside → `DENIED_ALREADY_INSIDE` / `DENIED_NOT_INSIDE`.
+6. Otherwise → `ACCESS_GRANTED`.
+
+On grant: the occupant is added to or removed from the inside list, the door task is commanded to open (green LED, servo, welcome/goodbye on LCD), and the event is logged. On denial: red LED for 2 s, LCD shows the exact denial reason, and the event is logged with its reason. The log line identifies whether the reader, the decision, or the table failed.
+
+### 6.5 Door hardware control (`door_ctrl.c`)
+
+One task (`door_task`) owns all door hardware. It consumes from a command queue (`xQueueCreate(8, sizeof(door_cmd_t))`) with a 100 ms receive timeout, then runs timer checks:
+
+- **Servos**: LEDC 14-bit, 50 Hz (20 ms period). Pulse width 500–2500 µs maps to 0–180°. Open = `SERVO_OPEN_DEG`, closed = `SERVO_CLOSED_DEG`.
+- **LEDs**: green = granted, red = denied. Deny LED stays on for `DENY_LED_MS` (2 s). Granted LED stays on while the door is open.
+- **LCD**: shows the result for `MESSAGE_SHOW_MS` (5 s), then reverts to the idle screen (inside count + time, or "Scan your card" / "Building CLOSED").
+- **Auto-close**: each door closes after `DOOR_OPEN_MS` (5 s) unless held open by emergency override.
+- **Emergency**: `CMD_EMERGENCY_ON` holds the exit door open with green LED; `CMD_EMERGENCY_OFF` restores normal operation.
+
+The door task is the **only** task that touches servos, LEDs, and LCD (single owner).
+
+### 6.6 Room state tracking (`rooms.c`)
+
+The hub maintains a room table (`MAX_ROOMS` entries), each with: id, occupied, light, online, last_seen, and change-tracking flags. It is populated exclusively by the MQTT callback (`rooms_handle_message`), which parses topics of the form `cocis-g1/rooms/<id>/<what>`:
+
+- `online` → sets online flag, logs on transition.
+- `status` → parses `occupied=N light=N`, updates state, logs only on change (the 5 s heartbeat repeats are not logged to SD).
+- `alert` → logs `INTRUSION` immediately.
+
+Reads take a mutex and copy out a snapshot (`rooms_list()`). The SD write happens **after** the lock is released, so a slow SD card never blocks the MQTT callback.
+
+### 6.7 Building state announcement (`building.c`)
+
+Every `PUBLISH_PERIOD_MS`, the hub publishes retained building state to `cocis-g1/building`:
+
+```
+open inside=N     (schedule open, no override)
+closed inside=N   (schedule closed)
+emergency inside=N (emergency override active)
+```
+
+This is the single source of truth for room terminals. Rooms subscribe to it and adjust their lighting behaviour accordingly.
+
+---
+
+## 7. Software design: room firmware
+
+### 7.1 Boot sequence (`rooms/app_main.c`)
+
+1. `light_start()` — initialises PIR, LDR, ultrasonic, light GPIO; starts the light task. The light works even if the network is down.
+2. Reads the board's MAC address (`ESP_MAC_WIFI_STA`). The last three bytes form the room id; the last byte is the room number.
+3. `net_start(client_id, TOPIC_HUB, online_topic)` — WiFi, SNTP, MQTT; subscribes to the building topic. Waits for WiFi (rooms block here, unlike the hub).
+4. Main loop every `LOOP_MS` (500 ms):
+    - Reads occupancy and light state from `light.c`.
+    - Publishes status when something changes, or every `STATUS_PERIOD_MS` as a heartbeat. Payload includes `room=N occupied=N light=N on_s=N open_s=N saved_pct=N`.
+    - Sends an `INTRUSION` alert when the intrusion counter increments.
+
+### 7.2 Lighting state machine (`rooms/light.c`)
+
+One task (`light_task`) runs every 100 ms:
+
+1. **Sensing**: reads PIR (motion), LDR (dark/bright), and HC-SR04 ultrasonic (distance in cm). Presence = PIR motion OR object closer than `EMPTY_DIST_CM - OBJECT_MARGIN_CM`.
+2. **Building closed**: forces light off, clears occupied, and on first presence after `INTRUSION_COOLDOWN_MS` increments the intrusion counter and notifies `room_main.c` (which publishes the alert to the hub).
+3. **Building open**: if present, sets occupied and turns the light on if dark. Every presence detection restarts the vacancy timer (`VACANCY_TIMEOUT_MS`, 15 s demo / 10 min real). Before switching off, the light **blinks for `WARN_MS`** as a warning; waving at the sensors cancels it. If the room is bright, the light turns off even while occupied.
+4. **Energy bookkeeping**: while the building is open, accumulates `on_ms` and `open_ms` for the `saved_pct` statistic reported in status messages.
 
 ![Room states](4-room-states.svg)
 
 ---
 
-## 7. Synchronisation design
+## 8. Access control flow
 
-The hub is one board running several parallel activities (the decision engine, the MQTT callback, the RFID polling task, the door/hardware task, the console, and the main reporting loop), and at the same time the system is three boards running at once. Section 2.3 explained why no *distributed* state is ever modified from two terminals; this section documents the *local* concurrency rules that keep the hub's own data coherent, and the rule book that made the choices reviewable before any of them were needed.
+The full flow (idle → tap → decision → act → log) is:
 
-### 7.1 The design rules
+1. **Idle screen**: LCD shows inside count + time, or "Scan your card" / "Building CLOSED".
+2. **Card tapped**: RFID reader detects card, reads UID, halts card.
+3. **Debounce**: same card + same reader within 2 s is ignored.
+4. **Scan event enqueued**: zero-timeout send to the scan queue. Full queue → tap dropped, logged.
+5. **Decision** (`access_ctrl.c` `decide()`): emergency exit → known → enabled → open hours → anti-passback → granted/denied.
+6. **Act**: door task opens servo + green LED + LCD welcome/goodbye (5 s), or red LED + LCD denial reason (2 s).
+7. **Log**: access event appended to `access_log.csv` with timestamp, side, UID, name, result, inside count.
 
-Three rules cover every shared object in the system, and each shared object was assigned exactly one of them:
+Denials show the exact reason on the LCD (unknown card, card disabled, outside hours, already inside, not inside). The log line tells you whether the reader, the decision, or the table failed, which halves debugging time.
 
-**Rule 1 — One owner task (single-writer-per resource).** A resource that only one task will ever touch gets no lock at all; instead the code **is structured so only that task can reach it**. Physical interfaces fit this rule naturally: the LCD, servos and door LEDs are driven only from the door task, the RFID chips only from the RFID task, and the decision state only inside the decision task. The rule is enforced by structure, not by thought: a race would require someone to *add* a second caller.
+The schedule is configurable only by authenticated personnel via the serial console (password as salted hash, lockout after repeated failures). Schedule changes are logged as system events.
 
-**Rule 2 — Message queues at task boundaries.** Whenever two tasks communicate, they exchange a *copy* of a small event through a FreeRTOS queue, never by sharing a variable. The queue hands ownership of the data over — the sender forgets the event, the receiver owns it. Two properties were chosen deliberately:
-- Queues are created **before** the producing tasks start, so there is no window in which a send can fail on an uninitialised handle, and the start-up order pins this (network → storage → decision engine → RFID).
-- Sends use a **zero-timeout**, meaning events are *dropped, not queued forever*, when the receiver falls behind. This is a stated policy: during a jam, losing the 3rd tap of the same card in 10 s (which the debouncer would have dropped anyway) is better than any task stalling — and drops are logged loudly, not silent.
-
-**Rule 3 — Mutexes for multi-reader, multi-writer state.** The two tables that genuinely have several users — the "currently inside" list and the room table — get one FreeRTOS mutex each, taken by **every** read and write, including small ones like the inside-count. Two supporting conventions matter more than the mutex itself:
-- *Copy-out on read*: readers receive a consistent snapshot (a copy made while holding the lock), so they never iterate a table that another task is mutating, and never hold the lock while they work on the copy.
-- *Work outside the lock*: slow operations (writing to the SD card, publishing to MQTT) are done after the mutex is released, so a slow SD card can never keep the decision engine or the MQTT callback waiting — it only makes that one log line late, never blocks the state change itself.
-
-### 7.2 How each shared object is built
-
-| Shared object | Written by | Read by | Design rule applied |
-|---|---|---|---|
-| Inside list (occupancy) | decision task only | decision task, door task (display), console | Rule 3 (mutex + copy-out) |
-| Room table | MQTT callback only | reporting loop, console | Rule 3 (mutex + copy-out) |
-| Scan events | RFID task | decision task | Rule 2 (queue) |
-| Door commands | decision task | door task | Rule 2 (queue) |
-| Door hardware (servos/LEDs/LCD) | door task only | — | Rule 1 |
-| RFID chips + reader state | RFID task only | — | Rule 1 |
-| Log files (SD) | see §7.3 | nobody (append-only) | Rule 1, one writer per file |
-| User table (RAM cache of `users.csv`) | console (add/remove) | decision task | Rule 3 (mutex) — lookups and table changes never overlap; the SD rewrite happens outside the lock so the decision task is never blocked by the card |
-| Schedule / override state (member E) | console task | decision task, reporting loop, door task | Rule 3 (mutex): the whole schedule is written under one lock, so every read sees a consistent open/close pair |
-| MQTT client | all tasks publish | — | component-internal locking (built into the ESP-IDF MQTT client, not our code) |
-
-The RAM-cache choice for the user table is Rule 1 carried into storage: the card is touched only at boot (to load) and when a user is added or deleted (to rewrite). Lookups — by far the most frequent operation — happen purely in RAM, so the SD bus is never on the decision's critical path.
-
-### 7.3 Storage concurrency: one writer per file
-
-SD-card writes are the system's slowest operation (tens of milliseconds), so instead of locking them we made every log file **append-only with exactly one writing task**:
-
-- `access_log.csv` — written only by the decision task, after a decision is final (never inside any lock, never blocking the door action queue)
-- `room_log.csv` — written only from the MQTT callback context
-- `users.csv` — rewritten only by the user-management code path
-
-Because file handles are opened fresh per write and no two tasks ever open the same log, no file-system locking is relied on at all — the concurrency guarantee is structural. A side effect of "open–write–close per line" worth stating: a crash or glitch can lose at most the line being written, never the file's earlier contents.
-
-The **failure policy** is fail-fast, by design: if the card fails, logging is disabled for the rest of the run (with one error), while access control continues to *decide* and *display* normally. An audit log we cannot trust is worse than a stopped one; locking people out because their log disk died is not acceptable behaviour for a door system.
-
-### 7.4 Distributed synchronisation (spec 2.7)
-
-The three boards never modify the same variable at the same time *by topology*: rooms only publish, the hub is the single writer of the inside list, schedule and logs. The remaining distributed questions — what does a new or restarting terminal know, and when does a dead one learn to be quiet — are delegated to two broker features rather than to any code we had to write:
-
-| Concern | Mechanism |
-|---|---|
-| Late join / reconnect misses state | every important message is **retained** (building state, room online flags): a subscriber gets the last value the instant it subscribes |
-| A terminal dying silently | MQTT **last will**: the broker publishes `<room> offline` the instant the TCP connection drops, even mid-crash |
-| Two taps arriving at once | Rule 2: they queue; the single decision task serialises them by construction |
-| Duplicated card reads | per-reader debounce before an event even enters the queue |
-| Topic echo (receiving your own state) | topic naming: nobody subscribes to a topic they publish (§2.2), so no loop is possible |
-| WiFi loss mid-operation | the hub keeps deciding and displaying without a network; state resumes from the retained messages on reconnect |
-| Definitive clock | every board runs SNTP; log timestamps are stamped by the hub, and a boot before SNTP succeeds marks its rows `no-time` rather than stamping a lie |
-
-### 7.5 What we did not do, on purpose
-
-- **No global lock guarding "everything"** — a coarse mutex around the entire hub would be easier to reason about but would serialise RFID polling, MQTT handling, door animation and SD writes behind each other; the per-object scheme keeps each slow subsystem isolated from the others.
-- **No interrupt-driven access to shared state** — every sensor goes through its own task and a queue; no ISR touches a table or list, which removes a whole class of bugs.
-- **No distributed locking protocol** — with one logical writer per datum (§2.3, §7.3), there is nothing for two terminals to contend over; correctness is bought by topology, which is much cheaper than by protocol.
+![Access flow](3-access-flow.svg)
 
 ---
 
-## 8. Requirements → features traceability
+## 9. Automated lighting flow
 
-| Req | Requirement | Where implemented | Status |
-|---|---|---|---|
-| 2.1 | Access control + occupancy monitoring | `rfid_reader` + `access_ctrl` + `occupancy` + `door_ctrl` on the hub | **working** |
-| 2.2 | Automated lighting by occupancy | `light.c` per room (PIR + ultrasonic + LDR + vacancy/warning) | **working** |
-| 2.3 | Distributed control, 3 terminals | hub-and-spoke over MQTT; `net.c`, `rooms.c`, `building.c` | **working** |
-| 2.4 | SD card data storage | `storage.c` — mounts the card, RAM-cached `users.csv`, three append-only log files | **working** |
-| 2.5 | Serial interface and menus | `components/management` (member E) — admin login, schedule and user commands, table dumps | **working** |
-| 2.6 | Configurable access schedule + auth | management component: hashed PIN, lockout, schedule change from the console, emergency override | **working** |
-| 2.7 | Synchronisation without conflicts | mutexes, single queue, single door task, single-writer rule, LWT, retained state | **working** |
+Room logic runs the state machine every 100 ms:
+
+1. **Presence** = PIR motion OR ultrasonic object < 250 cm. PIR misses still people; ultrasonic covers that blind spot.
+2. **Building open**: presence turns the light on if the LDR says dark. Every detection restarts the vacancy timer. Before switching off, the light blinks for 5 s as warning; waving cancels it.
+3. **Building closed**: light forced off, occupancy cleared, any presence raises an `INTRUSION` alert to the hub (at most one per 10 s).
+4. **Room status** published every 5 s (or on change) to `…/<id>/status`. `online` published on every MQTT connect (retained), so a hub that boots after a room still shows the room correctly.
 
 ---
 
-## 9. Demonstration guide
+## 10. Storage implementation: SD card & logging
 
-Wokwi card presets map to the user table: **Blue** = Alice (admin), **Green** = Bob (staff), **Yellow** = Carol (student), **Key Fob** = Dave (disabled card), **Red** and the **NFC tag** = unknown on purpose.
+### 10.1 Card and filesystem
 
-| Scenario | Expected |
-|---|---|
-| Blue on ENTRY | granted, inside count +1, LCD "Welcome Alice", door opens 5 s |
-| Blue on ENTRY again (after 2 s) | "Already inside", red LED |
-| Blue on EXIT | granted, count −1 |
-| Blue on EXIT again | "Not inside" |
-| Red on ENTRY/EXIT | "Unknown card" |
-| Key Fob | "Card disabled" |
-| Same card twice within 2 s | second tap ignored (debounce) |
-| Green card after schedule closes | "Outside hours" — entry *and* exit both refused |
-| Wave in a room | light on (if dark); light blinks after vacancy timeout, then off |
-| Wave in a room while the building is closed | light stays off, hub logs INTRUSION |
-| Stop a room simulation | hub marks that room offline instantly via last will |
+The hub mounts a FAT filesystem on a MicroSD card via `esp_vfs_fat_sdspi_mount()` at `/sdcard`, on its own SPI bus (SPI3_HOST, separate from the RFID SPI2 bus). If mount fails, `s_card_ok` is set to false and the system runs without storage — access control continues, logging is silently disabled.
+
+### 10.2 User table: RAM cache
+
+`users.csv` (format: `uid,name,role,enabled`) is loaded into a RAM array (`MAX_USERS` = 50) at boot. Lookups — by far the most frequent operation — happen purely in RAM under `s_users_lock`. The SD card is touched only at boot (load) and when a user is added or deleted (rewrite the whole file). This keeps the SD bus off the access decision's critical path.
+
+If `users.csv` is missing at boot, a demo table is created (Alice admin, Bob staff, Carol student, Dave disabled).
+
+### 10.3 Log files (append-only, one writer per file)
+
+SD writes are tens of milliseconds — the system's slowest operation. Instead of locking, every log file is append-only with exactly one writing task:
+
+| File             | Writer                                     | Content                                          |
+| ---------------- | ------------------------------------------ | ------------------------------------------------ |
+| `access_log.csv` | decision task (`log_access()`)             | timestamp, side, UID, name, result, inside count |
+| `room_log.csv`   | MQTT callback context (`log_room_event()`) | timestamp, room id, event, data                  |
+| `system.log`     | any task (`log_system_event()`)            | timestamp, message (boot, schedule change, etc.) |
+
+File handles are opened fresh per write (`fopen("a")` → `fprintf` → `fclose`). No two tasks open the same log, so no filesystem locking is relied on — the guarantee is structural. A crash can lose at most the line being written, never earlier contents.
+
+**Failure policy (fail-fast)**: if the card fails, logging is disabled for the rest of the run (one error logged to console), while access control continues to decide and display normally. An untrustworthy audit log is worse than a stopped one.
+
+### 10.4 Timestamps
+
+Each log line is stamped with `localtime_r()`. If SNTP has not set the clock (year < 2020), the stamp is `no-time` rather than a fabricated timestamp.
 
 ---
 
-## 10. Known limitations (stated honestly)
+## 11. Serial console: management menu & UART sharing
 
-- On a public broker the topic prefix acts as a group identifier, not as security — a production system would use a private broker with TLS and authentication.
-- The admin PIN is visible while typed on the serial monitor (UART cannot un-echo its input); this is stated rather than hidden.
-- An exit refused for non-emergency reasons is finally only unlocked by the authenticated emergency override — the safety trade-off is documented in §5.
+### 11.1 The problem with the first console
+
+The first console was a hand-written FreeRTOS task calling `getchar()` in a loop, matching input with `strcmp`, and printing its own `CoCIS> ` prompt. It worked functionally but failed as a terminal for two reasons:
+
+- **No echo.** `getchar()` reads raw bytes from UART0 and echoes nothing. Every typed character was invisible until the command's output appeared.
+- **One shared stream.** The console and ESP-IDF logging (`ESP_LOGI` from WiFi, MQTT, room messages) both write to UART0. While the user held the prompt, periodic log lines from other tasks were printed at the cursor position, burying both the prompt and the invisible input.
+
+The root cause was reinventing a terminal line-discipline layer (echo, editing, redraw, stream discipline) and rebuilding only part of it.
+
+### 11.2 Option chosen: `esp_console` (IDF console component)
+
+| Option                           | Why rejected/chosen                                                                                               |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Patch hand-written loop          | ~15 lines; fixes symptoms but keeps a hand-built parser with no history or completion                             |
+| `esp_console` (linenoise + REPL) | **Chosen** — official Espressif component, ships inside ESP-IDF v6 (no new dependency), removes our entire parser |
+| Split streams (logs on UART1)    | Clean on real hardware, but Wokwi only displays UART0 — the visible log stream would disappear                    |
+
+A spike (`console-spike/`) proved `linenoise` works with Wokwi's serial monitor (ANSI escape sequences render correctly: echo, backspace, Tab completion, Up/Down history) before migrating the real CLI.
+
+### 11.3 Console design
+
+`management_start_cli()` creates the REPL:
+
+```c
+esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+repl_config.prompt = "CoCIS> ";
+repl_config.max_history_len = 10;
+esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+esp_console_new_repl_uart(&uart_config, &repl_config, &repl);
+esp_console_register_help_command();
+// register commands...
+esp_console_start_repl(repl);
+```
+
+From that point, echo, line editing, history, and the prompt are the component's job. The code registers commands; it never reads characters again.
+
+### 11.4 Command set
+
+| Command                          | Behaviour                                                                      |
+| -------------------------------- | ------------------------------------------------------------------------------ |
+| `status`                         | Building status (times, open-now, admin, override) + occupancy/rooms extension |
+| `login`                          | Masked PIN prompt (`*`), admin session                                         |
+| `logout`                         | Clears admin session                                                           |
+| `override on\|off`               | Emergency override (admin-only)                                                |
+| `schedule show\|set HH:MM HH:MM` | Show or change access window                                                   |
+| `logs info\|warn`                | Runtime log level (quiet UART during demo)                                     |
+| `occupancy building\|rooms <id>` | Query inside count or room occupancy                                           |
+| `lighting status <id>`           | Query room lighting state                                                      |
+| `access records\|records <uid>`  | Access history (admin-gated, from SD)                                          |
+| `user add\|delete <uid>`         | Manage users (admin, interactive or one-shot)                                  |
+
+`help` is auto-generated from the registered command table.
+
+### 11.5 Masked PIN (requirement 2.6)
+
+With `esp_console`, a PIN passed as an argument would be echoed and stored in command history — unacceptable. So `login` takes no argument: its handler temporarily takes over the raw stream, printing one `*` per character with Backspace support. The PIN never lands in REPL history. Attempt counter, lockout (3 failures → 60 s), and 5-minute session timeout are enforced.
+
+### 11.6 Status extension hook
+
+The console component must not reach into the hub firmware's internals. The seam is one registration hook:
+
+```c
+management_register_status_ext(print_hub_status_ext);
+```
+
+`print_hub_status_ext()` prints who is inside (from `occupancy.c`) and each room's occupied/light/online state (from `rooms.c`). The console calls it at the end of `status` if registered. Access records remain on the SD card by design.
+
+### 11.7 Log discipline: the `logs` command
+
+Console and logs still share UART0 — that is physics, not software. `logs warn` sets the global level to `ESP_LOG_WARN` via `esp_log_level_set("*", ESP_LOG_WARN)`, so periodic INFO noise from MQTT/WiFi stops during a session. `logs info` restores verbose output. SD logging is unaffected (only the serial channel is quieted). Default during a demo: `logs warn`.
+
+### 11.8 Build impact
+
+The console component pushed the app past the default 1 MB app partition (`0x105c90 > 0x100000`). `sdkconfig.defaults` sets `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y`.
 
 ---
 
-## 11. Wokwi simulation links
+## 12. Data movement: how information flows through the system
 
-> <!-- paste the three links: hub workspace, room 1 workspace, room 2 workspace -->
+This section describes how data moves through the system — from physical sensors, across task boundaries, over the network, and into persistent storage — and through which data structures each form of information travels.
 
-## 12. Individual video demonstrations
+### Why queues between tasks
 
-> <!-- one link per member -->
+FreeRTOS queues are used at every task boundary instead of shared variables for three reasons:
 
-## 13. Individual contributions
+1. **Decoupling.** A producer and consumer run at different rates. The RFID task polls every 100 ms, but the access task only wakes when a card is actually tapped. A queue buffers the gap between them so neither task has to busy-wait or block on the other.
+2. **Ownership transfer.** When a `scan_event_t` is copied into `s_scan_queue`, the sender forgets it and the receiver owns it. Two tasks never point at the same memory, so there is no possibility of one task mutating data the other is reading.
+3. **Race prevention.** Shared variables require locks, and locks can be forgotten or taken in the wrong order. A queue is a lock-free handoff for the sender (zero-timeout send) and a blocking receive for the consumer — the synchronisation is built into the queue itself, not left to programmer discipline.
 
-> ## Member A — Entrance access control
-> <!-- 3–4 sentences: what they built (rfid_reader, access_ctrl, door_ctrl svg scope...) -->
+The alternative — a global shared struct protected by a mutex — would force every reader and writer to serialize on one lock, turning concurrent tasks into a sequential chain. Queues keep each task independent.
 
-## 14. Group member details
+### 12.1 Card tap to door action (hub local path)
 
-> <!-- Name · Student No · Role -->
+When a user taps a card at the entrance, data follows this path:
+
+1. **Physical → RFID task**: The MFRC522 reader detects the card's RF field and returns a 4- or 7-byte UID over SPI. The `rfid_task` reads the raw bytes from the chip's FIFO registers via polling SPI transactions, converts them to a hexadecimal string, and applies a per-reader debounce check (same card + same reader within 2 s is dropped).
+2. **RFID task → access task (queue)**: The debounced scan is packaged as a `scan_event_t` struct containing the door side (ENTRY or EXIT) and the UID string. This struct is copied by value into `s_scan_queue`, a FreeRTOS queue of depth 8 created before `rfid_task` starts. The send uses a zero timeout: if the queue is full, the tap is dropped and a warning is logged, rather than blocking the RFID poller.
+3. **Access task → decision**: `access_task` blocks on `xQueueReceive()` with `portMAX_DELAY`, waking only when a scan event arrives. It calls `decide()`, which consults the user table (via `user_lookup()`), the schedule (via `schedule_is_open()`), and the inside list (via `occupancy_is_inside()`). The result is an `access_result_t` enum.
+4. **Access task → door task (queue)**: On grant or deny, `access_ctrl` builds a `door_cmd_t` struct (command type, door side, granted flag, LCD line 1, LCD line 2) and copies it into `s_cmd_queue`, a FreeRTOS queue of depth 8 owned by `door_task`. The send uses a 100 ms timeout.
+5. **Door task → hardware**: `door_task` dequeues the command and drives the servo (via LEDC duty cycle), the LEDs (via GPIO levels), and the LCD (via I2C). It also maintains timers for auto-close and LED shutoff, reading the occupancy count from the mutex-protected inside list for the idle screen.
+
+At no point does a card UID or access decision travel as a shared pointer between tasks. Every handoff is a copy through a queue, so ownership transfers cleanly from producer to consumer.
+
+### 12.2 Room status to hub table (network path)
+
+Room terminals generate local presence and light data entirely inside `light_task`. That task runs every 100 ms and updates its own local variables (`occupied`, `light_on`, `on_ms`, `open_ms`, `intrusion_count`). These are not shared with any other task on the room board.
+
+The room's `app_main` loop (running every 500 ms) reads these local variables and packages them into a status string:
+
+```
+room=N occupied=0/1 light=0/1 on_s=N open_s=N saved_pct=N
+```
+
+This string is published via `net_publish()` (QoS 0) to `cocis-g1/rooms/<id>/status`. On the hub side, the MQTT task's `MQTT_EVENT_DATA` handler copies the topic and payload into stack-allocated buffers and calls `rooms_handle_message()`. That function parses the topic to extract the room id and message type, then takes the room table mutex, finds or creates the row for that room, and copies the occupied/light values into it. The mutex is released before any SD write occurs.
+
+### 12.3 Building state to rooms (network path)
+
+The hub's `app_main` loop calls `building_announce()` every `PUBLISH_PERIOD_MS`. This function reads the schedule state (`schedule_is_open()`), the emergency override (`override_active()`), and the occupancy count (`occupancy_count()`), then formats:
+
+```
+open inside=N
+closed inside=N
+emergency inside=N
+```
+
+This string is published via `net_publish_retained()` (QoS 1, retained) to `cocis-g1/building`. Every room subscribes to this topic. When a room connects or reconnects, the broker delivers the last retained message immediately, so the room knows whether the building is open or closed without waiting for the next announcement.
+
+### 12.4 Access decision to persistent storage
+
+When `access_task` reaches a final grant or deny decision, it calls `log_access()` from `storage.c`. This function builds a CSV line containing the timestamp, door side, UID, user name, result text, and current inside count, then appends it to `access_log.csv` on the SD card. This write happens **outside** any mutex and **outside** the door command queue — the decision and the door action proceed even if the SD card is slow or unresponsive. If the write fails, `s_card_ok` is set to false and subsequent log attempts are skipped until reboot.
+
+### 12.5 Console to shared state (management path)
+
+The serial console runs as an `esp_console` REPL task on UART0. When an administrator types `schedule set 08:00 14:30`, the `cmd_schedule` handler parses the arguments, validates them, and calls `management_set_schedule()`. That function takes `sched_lock`, writes the new opening and closing times atomically under one lock, and releases the lock. The decision task reads the schedule via `schedule_is_open()`, which takes the same lock, reads both times as a consistent snapshot, and releases the lock before computing whether the building is open.
+
+Similarly, `user add` and `user delete` commands call `users_add()` and `users_delete()` in `storage.c`, which take `s_users_lock`, modify the RAM user table, release the lock, then rewrite `users.csv` to the SD card outside the lock.
+
+### 12.6 Summary of data structures in motion
+
+| Data form             | Source                | Carried by                               | Destination                         |
+| --------------------- | --------------------- | ---------------------------------------- | ----------------------------------- |
+| Raw card UID (bytes)  | MFRC522 SPI registers | RFID task stack                          | scan_event_t struct                 |
+| scan_event_t          | RFID task             | s_scan_queue (FreeRTOS queue)            | access_task                         |
+| access_result_t       | access_task decision  | stack return value                       | door_cmd_t struct                   |
+| door_cmd_t            | access_task           | s_cmd_queue (FreeRTOS queue)             | door_task                           |
+| GPIO/LEDC values      | door_task             | direct register writes                   | servos, LEDs, LCD                   |
+| Status string (CSV)   | room light_task       | app_main stack buffer                    | MQTT publish → broker → rooms topic |
+| Room state row        | MQTT callback         | rooms.c internal array (mutex-guarded)   | console status, building announce   |
+| Building state string | building.c            | MQTT publish (retained)                  | all room subscribers                |
+| Access log line       | access_task           | fopen → fprintf → fclose                 | access_log.csv on SD card           |
+| Schedule times        | console command       | management RAM variables (mutex-guarded) | schedule_is_open() reads            |
+
+---
+
+## 13. Synchronisation design: tasks, mutexes & semaphores
+
+### 13.1 Hub task inventory
+
+| Task                            | Purpose                                  | Synchronisation primitives used                                            |
+| ------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------- |
+| `rfid_task`                     | Polls both RFID readers every 100 ms     | Produces to `s_scan_queue`                                                 |
+| `access_task`                   | Decision engine: grant/deny every scan   | Consumes `s_scan_queue`; reads occupancy/user table/schedule under mutexes |
+| `door_task`                     | Door hardware: servos, LEDs, LCD, timers | Consumes `s_cmd_queue`; reads occupancy count under mutex                  |
+| `mqtt_task` (ESP-IDF)           | WiFi/MQTT event handling                 | Calls `rooms_handle_message()` which takes room table mutex                |
+| `light_task` (rooms only)       | Lighting state machine every 100 ms      | Local variables only; no inter-task sharing                                |
+| `app_main` loop                 | Publish retained building state          | Reads occupancy/schedule/override under mutexes                            |
+| `esp_console` REPL (management) | Serial command processing                | Takes `sched_lock` and `s_users_lock` for config changes                   |
+
+### 13.2 Queues
+
+| Queue          | Producer(s)               | Consumer      | Depth | Send policy                        |
+| -------------- | ------------------------- | ------------- | ----- | ---------------------------------- |
+| `s_scan_queue` | `rfid_task`               | `access_task` | 8     | Zero-timeout: dropped, not blocked |
+| `s_cmd_queue`  | `access_task`, management | `door_task`   | 8     | 100 ms timeout                     |
+
+Queues are created **before** the producing tasks start, so there is no window in which a send can fail on an uninitialised handle. Zero-timeout sends mean events are dropped (logged loudly) rather than stalling a task — during a jam, losing a redundant tap is better than any task blocking.
+
+### 13.3 Mutexes
+
+| Mutex                     | Guards                                                   | Taken by                                                                               | Released before                                   |
+| ------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `s_lock` (occupancy)      | Inside list of currently-inside occupants                | `occupancy_add/remove/is_inside/count/list`, `door_task` idle screen                   | SD writes, MQTT publishes                         |
+| `s_lock` (rooms)          | Room table (occupied/light/online per room)              | MQTT callback, `rooms_list()`, `rooms_tick()`                                          | SD writes                                         |
+| `s_users_lock`            | User table RAM cache                                     | `user_lookup()`, `users_add()`, `users_delete()`                                       | SD card rewrite (`users_save()`)                  |
+| `sched_lock` (management) | Opening/closing times, emergency override, admin session | `schedule_is_open()`, `override_active()`, `management_set_schedule()`, console status | None — lock held only for the variable read/write |
+
+**Copy-out on read**: every mutex-protected read copies the data out while holding the lock, then releases the lock before working on the copy. No task ever iterates a table that another task is mutating, and no task holds a lock while performing slow operations.
+
+**Work outside the lock**: slow operations — writing to the SD card, publishing to MQTT — are performed after the mutex is released. A slow SD card can never keep the decision engine or the MQTT callback waiting; it only makes that one log line late.
+
+### 13.4 Semaphore usage notes
+
+All synchronisation in the hub uses binary semaphores configured as mutexes (`xSemaphoreCreateMutex()`). No counting semaphores are used. No task ever takes two mutexes simultaneously, eliminating deadlock by construction. The only exception is `users_add()` and `users_delete()`, which check for duplicate UIDs while holding `s_users_lock` — this is safe because `user_lookup()` would attempt to take the same non-recursive mutex, so the check is done inline under the existing lock rather than calling out.
+
+### 13.5 Distributed synchronisation (across boards)
+
+The three boards never modify the same variable at the same time by topology: rooms only publish, the hub is the single writer of the inside list, schedule, and logs. Remaining distributed concerns are delegated to broker features rather than application code:
+
+| Concern                               | Mechanism                                                                                                                                         |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Late join / reconnect misses state    | Every important message is **retained** (building state, room online flags): a subscriber gets the last value the instant it subscribes           |
+| A terminal dying silently             | MQTT **last will**: the broker publishes `<room>/offline` the instant the TCP connection drops, even mid-crash                                    |
+| Two taps arriving at once             | Rule 2: they queue; the single decision task serialises them by construction                                                                      |
+| Duplicated card reads                 | Per-reader debounce before an event enters the queue                                                                                              |
+| Topic echo (receiving your own state) | Topic naming: nobody subscribes to a topic they publish (§5.1)                                                                                    |
+| WiFi loss mid-operation               | The hub keeps deciding and displaying without a network; state resumes from retained messages on reconnect                                        |
+| Definitive clock                      | Every board runs SNTP; log timestamps are stamped by the hub, and a boot before SNTP succeeds marks its rows `no-time` rather than stamping a lie |
+
+## 14. Implemented features & requirements traceability
+
+| Req | Requirement                           | Implemented in                                                             | Status  |
+| --- | ------------------------------------- | -------------------------------------------------------------------------- | ------- |
+| 2.1 | Access control + occupancy monitoring | `rfid_reader`, `access_ctrl`, `occupancy`, `door_ctrl`                     | Working |
+| 2.2 | Automated lighting by occupancy       | `rooms/light.c` (PIR + ultrasonic + LDR + vacancy + warning)               | Working |
+| 2.3 | Distributed control, 3 terminals      | Hub-and-spoke MQTT; `net.c`, `rooms.c`, `building.c`                       | Working |
+| 2.4 | SD card data storage                  | `storage.c` — mount, RAM-cached `users.csv`, 3 append-only logs            | Working |
+| 2.5 | Serial interface and menus            | `components/management` — `esp_console` REPL, admin login, queries         | Working |
+| 2.6 | Configurable schedule + auth          | Management: hashed PIN, lockout, schedule change, emergency override       | Working |
+| 2.7 | Synchronisation without conflicts     | Mutexes, single queue, single door task, single-writer rule, LWT, retained | Working |
+
+---
+
+## 15. Known limitations
+
+- On a public broker the topic prefix is a group identifier, not security. Production would use a private broker with TLS and authentication.
+- The admin PIN is masked while typed but UART cannot un-echo; authentication happens on a shared, unencrypted serial line.
+- Logs and console share UART0; `logs warn` is policy, not isolation. On real hardware a second UART would be proper isolation.
+- An exit refused for non-emergency reasons is finally unlocked only by authenticated emergency override — a documented safety trade-off.
+
+---
+
+## 16. Wokwi simulation links
+
+> <!-- Hub workspace: -->
+> <!-- Room 1 workspace: -->
+> <!-- Room 2 workspace: -->
+
+## 17. Individual contributions
+
+Before dividing the implementation into individual responsibilities, the entire team worked together on the overall system design. The team jointly discussed the requirements, selected the hub-and-spoke architecture, planned the hardware arrangement, defined the data flow between tasks and boards, agreed on the MQTT topic structure, and established the interfaces between access control, room automation, storage, management, and communication. This shared design stage ensured that the individual components would integrate into one coherent system rather than operate as separate modules.
+
+After the common architecture and integration points had been agreed, each member took primary responsibility for a major functional area. The responsibilities were divided as follows:
+
+| Member                    | Main responsibility                                  | Main implementation areas                                                                                                              |
+| ------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Wamani Joshua             | Distributed control, communication, and system data movement | MQTT setup, topic design, hub-and-room connections, message routing, queues, task handoff, retained state, and last-will status |
+| Namugerwa Precious        | Serial management interface                          | Serial console, management commands, administrator authentication, schedule control, and management data queries                       |
+| Mutoni Esther             | RFID access control and entrance hardware            | RFID readers, UID handling, access decisions, servo-controlled doors, access LEDs, and LCD feedback                                    |
+| Mungi Benjamin            | Persistent storage and SD-card integration           | SD-card mounting, SPI configuration, user-table storage, access and system logs, and storage failure handling                          |
+| Namutebi Sulaina Luwambya | Automated room lighting control                      | Room firmware, PIR/LDR inputs, ultrasonic distance sensing, occupancy state, lighting decisions, vacancy timeout, and energy reporting |
+
+### Wamani Joshua - distributed control and communication
+
+Wamani implemented the distributed control and data-flow design connecting the hub and room terminals. He configured WiFi and MQTT, coordinated the topic structure and retained/last-will messages, and designed the internal FreeRTOS queues and task handoffs that move RFID events, door commands, room updates, and logs through the system.
+
+### Namugerwa Precious - serial interface and management
+
+Precious developed the serial management interface in the management files. This includes the `esp_console` command-line interface, command parsing, administrator login and authentication, login lockout behaviour, schedule management, emergency override commands, user-management commands, and management queries for system status and access records. Her work provides the operator-facing interface used to configure and monitor the system.
+
+### Mutoni Esther - access control and entrance hardware
+
+Esther developed the entrance access-control path. Her work includes reading RFID cards and their UIDs, passing card scans to the access decision task, checking whether a user is known and enabled, applying anti-passback rules, and recording entry or exit decisions. She also worked with the physical entrance peripherals: the entry and exit RFID readers, the door servos, the access LEDs, and the LCD messages that show welcome, denial, emergency, and occupancy information.
+
+### Mungi Benjamin - SD-card storage
+
+Mungi developed the storage subsystem and its configuration. His work includes configuring the microSD card and its separate SPI bus, mounting the FAT filesystem, loading and saving `users.csv`, maintaining the RAM user cache, and appending access, room, and system log records. He also handled the storage failure behaviour so that access control can continue operating when the SD card is unavailable.
+
+### Namutebi Sulaina Luwambya - automated lighting control
+
+Sulaina developed the room-terminal automation used to control lighting. Her work includes the room firmware, PIR motion sensing, LDR daylight detection, ultrasonic distance measurement, occupancy detection, vacancy timing, warning before lights switch off, intrusion detection while the building is closed, and the room energy-use reporting sent to the hub.
