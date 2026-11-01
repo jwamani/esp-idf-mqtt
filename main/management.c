@@ -836,7 +836,7 @@ static int cmd_user(int argc, char **argv)
             printf("Aborted.\n");
             return 0;
         }
-        printf("Delete user %s? (y/n): ");
+        printf("Delete user %s? (y/n): ", uid);
         fflush(stdout);
         char confirm[8];
         read_line(confirm, sizeof confirm);
